@@ -2,5 +2,15 @@
 name = "mon-osd"
 version = "0.1.0"
 edition = "2024"
+description = "Minimal DDC/CI CLI for controlling one external display on Apple Silicon, via the private IOAVService API."
+
+[[bin]]
+name = "mon-osd"
+path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
