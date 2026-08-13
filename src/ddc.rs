@@ -11,7 +11,7 @@ use std::time::Duration;
 pub const VCP_LUMINANCE: u8 = 0x10;
 pub const VCP_CONTRAST: u8 = 0x12;
 pub const VCP_VOLUME: u8 = 0x62;
-// pub const VCP_MUTE: u8 = 0x8D;
+pub const VCP_MUTE: u8 = 0x8D;
 
 const CHIP_ADDRESS_7BIT: u8 = 0x37;
 const DATA_ADDRESS: u32 = 0x51;
@@ -109,4 +109,64 @@ pub fn get_vcp(svc: &AvService, vcp_code: u8) -> Result<VcpReply, String> {
     let max = ((reply[6] as u16) << 8) | reply[7] as u16;
     let current = ((reply[8] as u16) << 8) | reply[9] as u16;
     Ok(VcpReply { current, max })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksum_is_xor_fold_starting_from_seed() {
+        assert_eq!(checksum(0x00, &[]), 0x00);
+        assert_eq!(checksum(0xFF, &[0xFF]), 0x00);
+        assert_eq!(checksum(0x50, &[0x01, 0x02]), 0x50 ^ 0x01 ^ 0x02);
+    }
+
+    #[test]
+    fn get_packet_has_expected_shape() {
+        // Get VCP for volume (0x62): send = [0x62], a single payload byte.
+        let packet = build_packet(&[VCP_VOLUME]);
+        // [length(0x80|2), opcode(=len=1... wait see below), vcp_code, checksum]
+        assert_eq!(packet.len(), 4);
+        assert_eq!(packet[0], 0x82); // 0x80 | (1 + 1)
+        assert_eq!(packet[1], 1);    // send.len() as u8 -- doubles as opcode
+        assert_eq!(packet[2], VCP_VOLUME);
+        // Checksum should validate against the seed used for single-byte sends.
+        let seed = CHIP_ADDRESS_7BIT << 1;
+        let expected = checksum(seed, &packet[..3]);
+        assert_eq!(packet[3], expected);
+    }
+
+    #[test]
+    fn set_packet_has_expected_shape() {
+        // Set VCP for luminance (0x10) to 0x1234: send = [vcp, hi, lo], 3 bytes.
+        let send = [VCP_LUMINANCE, 0x12, 0x34];
+        let packet = build_packet(&send);
+        assert_eq!(packet.len(), 6);
+        assert_eq!(packet[0], 0x84); // 0x80 | (3 + 1)
+        assert_eq!(packet[1], 3);
+        assert_eq!(&packet[2..5], &send);
+        let seed = (CHIP_ADDRESS_7BIT << 1) ^ (DATA_ADDRESS as u8);
+        let expected = checksum(seed, &packet[..5]);
+        assert_eq!(packet[5], expected);
+    }
+
+    #[test]
+    fn packet_never_includes_a_literal_source_address_byte() {
+        // Regression test for the bug where HOST_ADDRESS (0x51) was
+        // duplicated as packet[0] *and* passed separately as the
+        // transport's data_address, corrupting every byte after it.
+        let packet = build_packet(&[VCP_VOLUME]);
+        assert_ne!(packet[0], 0x51, "packet must not start with a literal source address byte");
+    }
+
+    #[test]
+    fn vcp_codes_are_distinct() {
+        let codes = [VCP_LUMINANCE, VCP_CONTRAST, VCP_VOLUME, VCP_MUTE];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j]);
+            }
+        }
+    }
 }

@@ -226,3 +226,20 @@ pub fn set_mute(mute_on: bool) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_known_who_error() {
+        let msg = friendly_status(0x77686F3F_u32 as OSStatus);
+        assert!(msg.contains("no software volume control"));
+    }
+
+    #[test]
+    fn falls_back_to_raw_status_for_unknown_codes() {
+        let msg = friendly_status(-1);
+        assert_eq!(msg, "OSStatus -1");
+    }
+}

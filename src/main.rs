@@ -380,3 +380,35 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vcp_code_accepts_known_features_case_insensitively() {
+        assert_eq!(vcp_code("volume"), Ok(ddc::VCP_VOLUME));
+        assert_eq!(vcp_code("VOLUME"), Ok(ddc::VCP_VOLUME));
+        assert_eq!(vcp_code("luminance"), Ok(ddc::VCP_LUMINANCE));
+        assert_eq!(vcp_code("brightness"), Ok(ddc::VCP_LUMINANCE)); // alias
+        assert_eq!(vcp_code("contrast"), Ok(ddc::VCP_CONTRAST));
+    }
+
+    #[test]
+    fn vcp_code_rejects_unknown_features() {
+        assert!(vcp_code("saturation").is_err());
+        assert!(vcp_code("").is_err());
+    }
+
+    #[test]
+    fn change_clamps_to_valid_range() {
+        // Mirrors the clamp logic used in the Change arm.
+        let current = 95i32;
+        let max = 100i32;
+        let new_val = (current + 20).clamp(0, max);
+        assert_eq!(new_val, 100);
+
+        let new_val = (5i32 - 20).clamp(0, max);
+        assert_eq!(new_val, 0);
+    }
+}
