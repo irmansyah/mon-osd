@@ -50,7 +50,11 @@ enum Command {
     /// Adjust a feature by +/- delta, clamped to [0, max]. Prints the
     /// resulting value on stdout, so Hammerspoon can draw an accurate bar
     /// without needing a second round trip.
-    Change { feature: String, delta: i32 },
+    Change {
+        feature: String,
+        #[arg(allow_hyphen_values = true)]
+        delta: i32,
+    },
     /// Set mute on/off (system output mute -- always CoreAudio, not DDC)
     Mute { state: String },
 }
@@ -173,6 +177,22 @@ fn main() {
         Command::Get { feature } if feature.eq_ignore_ascii_case("volume") => {
             match system_audio::get_volume_percent() {
                 Ok((cur, max)) => println!("{cur} {max}"),
+                Err(e) if e.contains("no software volume control") => {
+                    let av_index = match resolve_display_index(&cli.display) {
+                        Ok(i) => i,
+                        Err(resolve_err) => {
+                            eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {resolve_err}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let Some(svc) = AvService::display_at_index(av_index) else {
+                        eprintln!("error: system volume unavailable ({e}), and no AV display at index {av_index} for DDC fallback");
+                        std::process::exit(1);
+                    };
+                    let mut cache = Cache::load();
+                    let r = get_vcp_cached(&svc, &mut cache, ddc::VCP_VOLUME);
+                    println!("{} {}", r.current, r.max);
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -214,7 +234,31 @@ fn main() {
         }
         Command::Change { feature, delta } if feature.eq_ignore_ascii_case("volume") => {
             match system_audio::change_volume_percent(*delta) {
-                Ok((new_val, max)) => println!("{new_val} {max}"),
+                Ok((new_val, max)) => {
+                    println!("{new_val} {max}");
+                }
+                Err(e) if e.contains("no software volume control") => {
+                    let av_index = match resolve_display_index(&cli.display) {
+                        Ok(i) => i,
+                        Err(resolve_err) => {
+                            eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {resolve_err}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let Some(svc) = AvService::display_at_index(av_index) else {
+                        eprintln!("error: system volume unavailable ({e}), and no AV display at index {av_index} for DDC fallback");
+                        std::process::exit(1);
+                    };
+                    let mut cache = Cache::load();
+                    let reply = get_vcp_cached(&svc, &mut cache, ddc::VCP_VOLUME);
+                    let new_val = (reply.current as i32 + *delta).clamp(0, reply.max as i32) as u16;
+                    if let Err(ddc_err) = ddc::set_vcp(&svc, ddc::VCP_VOLUME, new_val) {
+                        eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {ddc_err}");
+                        std::process::exit(1);
+                    }
+                    cache.set(ddc::VCP_VOLUME, new_val, reply.max);
+                    println!("{new_val} {}", reply.max);
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);

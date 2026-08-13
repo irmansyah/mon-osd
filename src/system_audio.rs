@@ -153,7 +153,8 @@ fn get_volume_scalar(device_id: AudioObjectID) -> Result<f32, String> {
         )
     };
     if status != 0 {
-        return Err(format!("failed to get volume (OSStatus {status})"));
+        let name = device_name(device_id).unwrap_or_else(|| "current output device".to_string());
+        return Err(format!("failed to get volume on \"{name}\": {}", friendly_status(status)));
     }
     Ok(volume)
 }
