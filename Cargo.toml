@@ -4,12 +4,23 @@ version = "0.1.0"
 edition = "2024"
 description = "Minimal DDC/CI CLI for controlling one external display on Apple Silicon, via the private IOAVService API."
 
+[lib]
+name = "mon_osd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mon-osd"
-path = "src/main.rs"
+path = "src/bin/mon-osd.rs"
+
+[[bin]]
+name = "mon-osd-menubar"
+path = "src/bin/mon-osd-menubar.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+tray-icon = "0.24"       # menu bar icon, or swap for objc2-app-kit if you want raw NSStatusItem
+objc2 = "0.6"
+objc2-foundation = "0.3"
 
 [profile.release]
 opt-level = "z"

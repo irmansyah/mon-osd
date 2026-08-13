@@ -1,4 +1,5 @@
 // src/ddc.rs
+
 //! DDC/CI "VCP Feature" get/set, ported from MonitorControl's Arm64DDC.swift
 //! (github.com/MonitorControl/MonitorControl), which is verified against
 //! real Apple Silicon hardware. Our earlier hand-rolled packet format
