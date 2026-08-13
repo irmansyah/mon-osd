@@ -20,5 +20,6 @@
 .rustfmt.log
 .cargo-ok
 .cargo/config.toml.local
+.DS_Store
 
 **/.bak/
