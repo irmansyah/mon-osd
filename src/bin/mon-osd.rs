@@ -4,6 +4,22 @@
 // difference is that the modules now live in the `mon_osd` lib crate
 // (src/lib.rs) so they can be shared with src/bin/mon-osd-menubar.rs,
 // instead of being declared inline with `mod ...;` here.
+//
+// FIX (display index resolution): `--display` indices are no longer
+// trusted blindly. IOAV enumeration order isn't guaranteed stable across
+// reboots/hotplugs, so we verify the index actually resolves to a live
+// AvService, and if it doesn't, retry the adjacent index (+/-1) before
+// failing (see `resolve_av_service`).
+//
+// FIX (cursor mapping persistence): `--display cursor` used to resolve by
+// looking up the mouse's CGDirectDisplayID directly in DisplayMap. But
+// CGDirectDisplayID is session-local and gets reassigned by macOS across
+// power cycles, sleep/wake, and reconnects -- so a saved mapping would
+// silently break (point at the wrong monitor, or nothing) every time an
+// external display was turned off and back on. DisplayMap is now keyed by
+// EDID-derived DisplayIdentity (vendor/model/serial) instead, which is
+// read from the monitor's own firmware and doesn't change with any of
+// that. `map`/`mappings`/`cursor` all resolve through this identity now.
 
 use clap::{Parser, Subcommand};
 use mon_osd::{cache::Cache, cursor, ddc, display_map::DisplayMap, ioav, ioav::AvService, native_brightness, system_audio};
@@ -11,11 +27,14 @@ use mon_osd::{cache::Cache, cursor, ddc, display_map::DisplayMap, ioav, ioav::Av
 #[derive(Parser)]
 #[command(name = "mon-osd", about = "Minimal brightness/volume/contrast control across built-in and external displays")]
 struct Cli {
-    /// Which external display to target for DDC (luminance/contrast on
-    /// non-built-in screens): an index from `mon-osd list`, or "cursor" to
-    /// auto-pick whichever monitor the mouse is on. Ignored for volume/mute
-    /// (always system-wide) and for luminance when the cursor is on the
-    /// built-in display (routed to the native brightness API instead).
+    /// Which external display to target for DDC luminance/contrast on
+    /// non-built-in screens: an index from `mon-osd list`, or "cursor" to
+    /// auto-pick whichever monitor the mouse is on. Ignored entirely for
+    /// volume and mute -- volume is a single system-wide source, not tied
+    /// to cursor position, so its DDC fallback uses the index pinned via
+    /// `mon-osd map-volume` instead. Also ignored for luminance when the
+    /// cursor is on the built-in display (routed to the native brightness
+    /// API instead).
     #[arg(long, global = true, default_value = "0")]
     display: String,
 
@@ -25,20 +44,36 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Command {
-    /// List AV-capable external displays found in the IORegistry
+    /// List AV-capable external displays found in the IORegistry, along
+    /// with their live EDID identity (vendor/model/serial) where readable.
     List,
     /// Associate the display currently under the mouse cursor with an AV
     /// index (from `mon-osd list`). Move the mouse onto an external
-    /// monitor, then run this. Auto-labels with the aerospace-reported
-    /// monitor name unless --name is given. Do NOT run this while the
-    /// cursor is on the built-in display -- it doesn't use DDC at all.
+    /// monitor, then run this. Saved against that monitor's EDID identity,
+    /// not its (unstable) CGDirectDisplayID. Auto-labels with the
+    /// aerospace-reported monitor name unless --name is given. Do NOT run
+    /// this while the cursor is on the built-in display -- it doesn't use
+    /// DDC/AV indices at all.
     Map {
         index: usize,
         #[arg(long)]
         name: Option<String>,
     },
-    /// Show all saved cursor-display -> AV-index mappings
+    /// Show all saved display-identity -> AV-index mappings
     Mappings,
+    /// Pin the AV index used as the DDC fallback for system volume, when
+    /// CoreAudio can't control it (e.g. output is an external monitor's
+    /// speakers). Unlike `map`, this is NOT tied to the cursor or to any
+    /// particular monitor's identity -- volume is a single, system-wide
+    /// source, so there's exactly one pinned index, set once here, used
+    /// regardless of where the cursor is.
+    MapVolume { index: usize },
+    /// Show which display the cursor is currently on: its
+    /// CGDirectDisplayID, whether it's the built-in panel, its EDID
+    /// identity (for external displays), and its mapped AV index if one
+    /// exists. Pure read-only debug helper -- doesn't change or save
+    /// anything, unlike `map`.
+    Cursor,
     /// Print current + max value for a feature ("luminance" | "volume" | "contrast")
     Get { feature: String },
     /// Set a feature to an absolute value (0-100 typical)
@@ -81,8 +116,13 @@ fn aerospace_focused_monitor_name() -> Option<String> {
     Some(name.trim().to_string())
 }
 
-/// Resolves `--display` (a literal index, or "cursor") to a concrete AV
-/// index for DDC-based commands (external monitor luminance/contrast).
+/// Resolves `--display` (a literal AV index, or "cursor") to a candidate
+/// AV index. For "cursor", this looks up the saved mapping keyed by the
+/// EDID-derived identity of whatever display the mouse is currently on --
+/// not by CGDirectDisplayID, which drifts across power cycles/reconnects.
+/// This is just the *parse/lookup* step -- it does NOT verify the index
+/// still points at a live display. Use `resolve_av_service` below for
+/// that, which self-corrects a stale/off-by-one index.
 fn resolve_display_index(selector: &str) -> Result<usize, String> {
     if selector.eq_ignore_ascii_case("cursor") {
         let display_id = cursor::display_under_cursor()
@@ -94,11 +134,13 @@ fn resolve_display_index(selector: &str) -> Result<usize, String> {
             );
         }
 
+        let identity = cursor::display_identity(display_id);
         let map = DisplayMap::load();
-        map.get(display_id).ok_or_else(|| {
+        map.get(identity).ok_or_else(|| {
             format!(
-                "no mapping for the display under the cursor (CGDirectDisplayID {display_id:#x}) -- \
-                 move the mouse onto each monitor once and run `mon-osd map <index>` (see `mon-osd list` for indices)"
+                "no mapping for the display under the cursor (vendor {:#06x} model {:#06x} serial {:#010x}) -- \
+                 move the mouse onto each monitor once and run `mon-osd map <index>` (see `mon-osd list` for indices)",
+                identity.vendor, identity.model, identity.serial
             )
         })
     } else {
@@ -106,6 +148,72 @@ fn resolve_display_index(selector: &str) -> Result<usize, String> {
             .parse::<usize>()
             .map_err(|_| format!("invalid --display value '{selector}' (expected a number or \"cursor\")"))
     }
+}
+
+/// Resolves `--display` to a *verified, live* AvService.
+///
+/// IOAV enumeration order isn't guaranteed stable across reboots/hotplugs,
+/// so an index that resolved correctly when it was saved (via `mon-osd
+/// map`) or typed literally can silently drift by one. Rather than
+/// trusting the raw index, we confirm it resolves to a live AvService, and
+/// if it doesn't, retry the neighboring index (+1, then -1) before giving
+/// up.
+fn resolve_av_service(selector: &str) -> Result<AvService, String> {
+    let av_index = resolve_display_index(selector)?;
+
+    if let Some(svc) = AvService::display_at_index(av_index) {
+        return Ok(svc);
+    }
+
+    for candidate in [av_index.checked_add(1), av_index.checked_sub(1)].into_iter().flatten() {
+        if let Some(svc) = AvService::display_at_index(candidate) {
+            eprintln!(
+                "note: display index {av_index} didn't resolve, but {candidate} did -- \
+                 your mapping may be off by one (IOAV enumeration order can shift between \
+                 sessions). Run `mon-osd list` to check current indices, and re-run \
+                 `mon-osd map {candidate}` for this monitor to fix it permanently."
+            );
+            return Ok(svc);
+        }
+    }
+
+    Err(format!(
+        "no AV-capable display at index {av_index} (check it's on USB-C/DisplayPort, not the \
+         M1/entry-M2 HDMI port; run `mon-osd list` to see available indices)"
+    ))
+}
+
+/// Resolves the volume DDC fallback to a *verified, live* AvService, using
+/// the AV index pinned via `mon-osd map-volume <index>` -- NOT cursor
+/// position or `--display`. Volume is a single system-wide source, so
+/// there's exactly one relevant index, set once, rather than something
+/// re-resolved per monitor like brightness/contrast.
+fn resolve_volume_av_service() -> Result<AvService, String> {
+    let av_index = mon_osd::display_map::load_volume_index().ok_or_else(|| {
+        "no volume AV index pinned yet -- volume is a single system-wide source, not tied to \
+         cursor position, so run `mon-osd map-volume <index>` once (see `mon-osd list` for \
+         indices) instead of relying on --display cursor"
+            .to_string()
+    })?;
+
+    if let Some(svc) = AvService::display_at_index(av_index) {
+        return Ok(svc);
+    }
+
+    for candidate in [av_index.checked_add(1), av_index.checked_sub(1)].into_iter().flatten() {
+        if let Some(svc) = AvService::display_at_index(candidate) {
+            eprintln!(
+                "note: pinned volume index {av_index} didn't resolve, but {candidate} did -- \
+                 run `mon-osd map-volume {candidate}` to fix this permanently."
+            );
+            return Ok(svc);
+        }
+    }
+
+    Err(format!(
+        "no AV-capable display at pinned volume index {av_index} -- run `mon-osd list` and \
+         `mon-osd map-volume <index>` again"
+    ))
 }
 
 /// Fetches the current VCP value from an external monitor, preferring a
@@ -135,7 +243,13 @@ fn main() {
             std::process::exit(1);
         }
         for d in displays {
-            println!("{}: registry id {:#x}", d.index, d.registry_id);
+            match d.identity {
+                Some(id) => println!(
+                    "{}: registry id {:#x}, vendor {:#06x} model {:#06x} serial {:#010x}",
+                    d.index, d.registry_id, id.vendor, id.model, id.serial
+                ),
+                None => println!("{}: registry id {:#x} (EDID read failed)", d.index, d.registry_id),
+            }
         }
         return;
     }
@@ -146,23 +260,88 @@ fn main() {
             eprintln!("could not determine which display the cursor is on");
             std::process::exit(1);
         };
+        if cursor::is_builtin_display(display_id) == Some(true) {
+            eprintln!("cursor is on the built-in display -- it doesn't use DDC/AV indices, nothing to map");
+            std::process::exit(1);
+        }
+        let identity = cursor::display_identity(display_id);
         let resolved_name = name.clone().or_else(aerospace_focused_monitor_name);
         let mut map = DisplayMap::load();
-        map.set(display_id, *index, resolved_name.clone());
+        map.set(identity, *index, resolved_name.clone());
         match resolved_name {
-            Some(n) => println!("mapped display {display_id:#x} (\"{n}\") -> AV index {index}"),
-            None => println!("mapped display {display_id:#x} -> AV index {index}"),
+            Some(n) => println!(
+                "mapped display vendor {:#06x} model {:#06x} serial {:#010x} (\"{n}\") -> AV index {index}",
+                identity.vendor, identity.model, identity.serial
+            ),
+            None => println!(
+                "mapped display vendor {:#06x} model {:#06x} serial {:#010x} -> AV index {index}",
+                identity.vendor, identity.model, identity.serial
+            ),
         }
         return;
     }
 
-    // --- Mappings: show saved cursor-display -> AV-index mappings ---
+    // --- Mappings: show saved display-identity -> AV-index mappings ---
     if matches!(cli.command, Command::Mappings) {
         let map = DisplayMap::load();
         for (id, m) in map.all() {
             match &m.name {
-                Some(n) => println!("{id:#x} -> AV index {} (\"{n}\")", m.av_index),
-                None => println!("{id:#x} -> AV index {}", m.av_index),
+                Some(n) => println!(
+                    "vendor {:#06x} model {:#06x} serial {:#010x} -> AV index {} (\"{n}\")",
+                    id.vendor, id.model, id.serial, m.av_index
+                ),
+                None => println!(
+                    "vendor {:#06x} model {:#06x} serial {:#010x} -> AV index {}",
+                    id.vendor, id.model, id.serial, m.av_index
+                ),
+            }
+        }
+        return;
+    }
+
+    // --- MapVolume: pin the single system-wide volume AV index ---
+    if let Command::MapVolume { index } = &cli.command {
+        mon_osd::display_map::save_volume_index(*index);
+        println!("pinned volume DDC fallback to AV index {index} (used regardless of cursor position)");
+        return;
+    }
+
+    // --- Cursor: read-only report of which display the cursor is on ---
+    if matches!(cli.command, Command::Cursor) {
+        let Some(display_id) = cursor::display_under_cursor() else {
+            eprintln!("could not determine which display the cursor is on");
+            std::process::exit(1);
+        };
+
+        match cursor::is_builtin_display(display_id) {
+            Some(true) => {
+                println!("{display_id:#x} -- built-in display (native brightness API, no DDC/AV index)");
+            }
+            Some(false) => {
+                let identity = cursor::display_identity(display_id);
+                let map = DisplayMap::load();
+                match map.get(identity) {
+                    Some(av_index) => {
+                        let live = if AvService::display_at_index(av_index).is_some() {
+                            "resolves"
+                        } else {
+                            "STALE -- does not resolve, run `mon-osd list` and re-map"
+                        };
+                        println!(
+                            "{display_id:#x} (vendor {:#06x} model {:#06x} serial {:#010x}) -- external display, mapped to AV index {av_index} ({live})",
+                            identity.vendor, identity.model, identity.serial
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{display_id:#x} (vendor {:#06x} model {:#06x} serial {:#010x}) -- external display, no mapping yet (run `mon-osd map <index>`, see `mon-osd list`)",
+                            identity.vendor, identity.model, identity.serial
+                        );
+                    }
+                }
+            }
+            None => {
+                println!("{display_id:#x} -- could not determine whether this is built-in or external");
             }
         }
         return;
@@ -174,16 +353,12 @@ fn main() {
             match system_audio::get_volume_percent() {
                 Ok((cur, max)) => println!("{cur} {max}"),
                 Err(e) if e.contains("no software volume control") => {
-                    let av_index = match resolve_display_index(&cli.display) {
-                        Ok(i) => i,
+                    let svc = match resolve_volume_av_service() {
+                        Ok(s) => s,
                         Err(resolve_err) => {
                             eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {resolve_err}");
                             std::process::exit(1);
                         }
-                    };
-                    let Some(svc) = AvService::display_at_index(av_index) else {
-                        eprintln!("error: system volume unavailable ({e}), and no AV display at index {av_index} for DDC fallback");
-                        std::process::exit(1);
                     };
                     let mut cache = Cache::load();
                     let r = get_vcp_cached(&svc, &mut cache, ddc::VCP_VOLUME);
@@ -201,17 +376,14 @@ fn main() {
                 Ok(()) => {}
                 Err(e) if e.contains("no software volume control") => {
                     // CoreAudio can't control this device -- fall back to the
-                    // monitor's own hardware volume via DDC.
-                    let av_index = match resolve_display_index(&cli.display) {
-                        Ok(i) => i,
+                    // monitor's own hardware volume via DDC, at the pinned
+                    // volume index (not cursor position).
+                    let svc = match resolve_volume_av_service() {
+                        Ok(s) => s,
                         Err(resolve_err) => {
                             eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {resolve_err}");
                             std::process::exit(1);
                         }
-                    };
-                    let Some(svc) = AvService::display_at_index(av_index) else {
-                        eprintln!("error: system volume unavailable ({e}), and no AV display at index {av_index} for DDC fallback");
-                        std::process::exit(1);
                     };
                     if let Err(ddc_err) = ddc::set_vcp(&svc, ddc::VCP_VOLUME, *value) {
                         eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {ddc_err}");
@@ -234,16 +406,12 @@ fn main() {
                     println!("{new_val} {max}");
                 }
                 Err(e) if e.contains("no software volume control") => {
-                    let av_index = match resolve_display_index(&cli.display) {
-                        Ok(i) => i,
+                    let svc = match resolve_volume_av_service() {
+                        Ok(s) => s,
                         Err(resolve_err) => {
                             eprintln!("error: system volume unavailable ({e}), and DDC fallback failed: {resolve_err}");
                             std::process::exit(1);
                         }
-                    };
-                    let Some(svc) = AvService::display_at_index(av_index) else {
-                        eprintln!("error: system volume unavailable ({e}), and no AV display at index {av_index} for DDC fallback");
-                        std::process::exit(1);
                     };
                     let mut cache = Cache::load();
                     let reply = get_vcp_cached(&svc, &mut cache, ddc::VCP_VOLUME);
@@ -325,26 +493,16 @@ fn main() {
     }
 
     // --- Everything else: DDC over an external monitor ---
-    let av_index = match resolve_display_index(&cli.display) {
-        Ok(i) => i,
+    let svc = match resolve_av_service(&cli.display) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
 
-    let svc = match AvService::display_at_index(av_index) {
-        Some(s) => s,
-        None => {
-            eprintln!(
-                "no AV-capable display at index {av_index} (check it's on USB-C/DisplayPort, not the M1/entry-M2 HDMI port; run `mon-osd list` to see available indices)"
-            );
-            std::process::exit(1);
-        }
-    };
-
     let result = match cli.command {
-        Command::List | Command::Map { .. } | Command::Mappings | Command::Mute { .. } => {
+        Command::List | Command::Map { .. } | Command::Mappings | Command::MapVolume { .. } | Command::Cursor | Command::Mute { .. } => {
             unreachable!("handled above")
         }
         Command::Get { feature } => vcp_code(&feature).and_then(|code| {

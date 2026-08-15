@@ -52,6 +52,64 @@ unsafe extern "C" {
 }
 
 pub const DDC_CHIP_ADDRESS: c_uint = 0x37;
+// Standard I2C address for reading a display's EDID over DDC/CI. This is a
+// VESA-standardized address (not Apple-private), so it's the same on every
+// DDC-capable monitor regardless of vendor.
+pub const EDID_CHIP_ADDRESS: c_uint = 0x50;
+const EDID_LEN: usize = 128;
+const EDID_MAGIC: [u8; 8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+
+/// Vendor/model/serial pulled from a display's EDID. These three values
+/// are burned into the monitor's firmware, so unlike CGDirectDisplayID or
+/// IORegistryEntryID, they survive power cycles, sleep/wake, and
+/// reconnects -- this is what a persistent display mapping should be keyed
+/// on.
+///
+/// Field values match exactly what CoreGraphics' CGDisplayVendorNumber /
+/// CGDisplayModelNumber / CGDisplaySerialNumber return for a
+/// CGDirectDisplayID (see src/cursor.rs), so an identity read live from
+/// EDID here can be compared directly against one computed from the
+/// cursor's CGDirectDisplayID, with no decoding needed on either side.
+///
+/// Caveat: some monitors don't set a real serial number in their EDID
+/// (leave it 0), so two identical-model, unserialized monitors could in
+/// theory collide. Not something we can detect or fix from software --
+/// if you hit it, `mon-osd list`'s printed identity will look identical
+/// for both and you'll need `mon-osd mappings` + physical testing to sort
+/// out which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DisplayIdentity {
+    pub vendor: u32,
+    pub model: u32,
+    pub serial: u32,
+}
+
+fn parse_edid_identity(edid: &[u8; EDID_LEN]) -> Option<DisplayIdentity> {
+    if edid[0..8] != EDID_MAGIC {
+        return None;
+    }
+    let vendor = u16::from_be_bytes([edid[8], edid[9]]) as u32;
+    let model = u16::from_le_bytes([edid[10], edid[11]]) as u32;
+    let serial = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+    Some(DisplayIdentity { vendor, model, serial })
+}
+
+unsafe fn read_edid_identity(svc: IoavServiceRef) -> Option<DisplayIdentity> {
+    let mut buf = [0u8; EDID_LEN];
+    let ret = unsafe {
+        IOAVServiceReadI2C(
+            svc,
+            EDID_CHIP_ADDRESS,
+            0,
+            buf.as_mut_ptr() as *mut c_void,
+            EDID_LEN as c_uint,
+        )
+    };
+    if ret != KIO_RETURN_SUCCESS {
+        return None;
+    }
+    parse_edid_identity(&buf)
+}
 
 /// Enumerates every `DCPAVServiceProxy` entry currently in the IORegistry
 /// (one per AV-capable display on Apple Silicon). Caller owns the returned
@@ -82,14 +140,15 @@ fn enumerate_dcp_av_service_proxies() -> Vec<io_service_t> {
 }
 
 /// Basic identifying info for a display found in the registry.
-/// `registry_id` is stable across launches but not human-friendly on its
-/// own -- cross-reference with `ioreg -c DCPAVServiceProxy -l` or System
-/// Information if you need to confirm which physical display an index maps
-/// to (product-name lookup isn't implemented here since I can't verify
-/// which registry key holds it without real hardware to test against).
+/// `registry_id` is stable across launches but, like CGDirectDisplayID, is
+/// NOT guaranteed stable across power cycles/reconnects -- use `identity`
+/// (EDID-derived) for anything you need to persist.
 pub struct DisplayInfo {
     pub index: usize,
     pub registry_id: u64,
+    /// Best-effort EDID identity, read live over DDC. None if the read or
+    /// parse failed (monitor asleep, doesn't answer EDID-over-DDC, etc.).
+    pub identity: Option<DisplayIdentity>,
 }
 
 pub fn list_displays() -> Vec<DisplayInfo> {
@@ -100,7 +159,11 @@ pub fn list_displays() -> Vec<DisplayInfo> {
         unsafe {
             IORegistryEntryGetRegistryEntryID(*service, &mut registry_id);
         }
-        out.push(DisplayInfo { index, registry_id });
+        let identity = unsafe {
+            let svc = IOAVServiceCreateWithService(std::ptr::null(), *service);
+            if svc.is_null() { None } else { read_edid_identity(svc) }
+        };
+        out.push(DisplayInfo { index, registry_id, identity });
     }
     for service in services {
         unsafe { IOObjectRelease(service) };
@@ -141,6 +204,12 @@ impl AvService {
     #[allow(dead_code)]
     pub fn default_display() -> Option<Self> {
         Self::display_at_index(0)
+    }
+
+    /// Reads this display's EDID over DDC and extracts its vendor/model/
+    /// serial identity. None if the read or parse fails.
+    pub fn identity(&self) -> Option<DisplayIdentity> {
+        unsafe { read_edid_identity(self.0) }
     }
 
     pub fn write_i2c(&self, data_address: u32, packet: &[u8]) -> Result<(), IoReturn> {
